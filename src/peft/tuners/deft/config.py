@@ -112,6 +112,16 @@ class DeftConfig(PeftConfig):
         default=False,
         metadata={"help": "Whether to learn a scalar sigmoid gate that scales the injected update."},
     )
+    use_injection: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Whether to include the injection term `g * Q_P @ R`. If False, the update is pure subspace removal "
+                "`delta = -P_proj @ W` (the PaRa method): R is not created, P is the only trainable matrix, and the "
+                "adapter cannot be an identity at init. Defaults to True."
+            )
+        },
+    )
     deft_dropout: float = field(
         default=0.0,
         metadata={"help": "The dropout probability applied to the layer input."},

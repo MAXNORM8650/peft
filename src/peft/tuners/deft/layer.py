@@ -28,7 +28,7 @@ class DeftLayer(BaseTunerLayer):
     # All names of layers that may contain (trainable) adapter weights
     adapter_layer_names = ("deft_P", "deft_R", "deft_gate")
     # All names of other parameters that may contain adapter-related parameters
-    other_param_names = ("deft_r", "deft_decomposition", "deft_use_gating", "deft_init_scale")
+    other_param_names = ("deft_r", "deft_decomposition", "deft_use_gating", "deft_init_scale", "deft_use_injection")
 
     def __init__(self, base_layer: nn.Module, **kwargs) -> None:
         self.base_layer = base_layer
@@ -36,6 +36,7 @@ class DeftLayer(BaseTunerLayer):
         self.deft_decomposition = {}
         self.deft_use_gating = {}
         self.deft_init_scale = {}
+        self.deft_use_injection = {}
         self.deft_P = nn.ParameterDict({})
         self.deft_R = nn.ParameterDict({})
         self.deft_gate = nn.ParameterDict({})
@@ -81,15 +82,18 @@ class DeftLayer(BaseTunerLayer):
         self.deft_decomposition[adapter_name] = config.decomposition_method
         self.deft_use_gating[adapter_name] = config.use_gating
         self.deft_init_scale[adapter_name] = config.init_scale
+        self.deft_use_injection[adapter_name] = config.use_injection
 
         if config.deft_dropout > 0.0:
             self.deft_dropout[adapter_name] = nn.Dropout(p=config.deft_dropout)
         else:
             self.deft_dropout[adapter_name] = nn.Identity()
 
-        # P: projection direction (out_features x r); R: injection matrix (r x in_features)
+        # P: projection direction (out_features x r); R: injection matrix (r x in_features, only if use_injection).
+        # With use_injection=False the update is pure subspace removal `-P_proj @ W` (the PaRa method), and R is unused.
         self.deft_P[adapter_name] = nn.Parameter(torch.empty(self.out_features, r))
-        self.deft_R[adapter_name] = nn.Parameter(torch.empty(r, self.in_features))
+        if config.use_injection:
+            self.deft_R[adapter_name] = nn.Parameter(torch.empty(r, self.in_features))
         if config.use_gating:
             self.deft_gate[adapter_name] = nn.Parameter(torch.full((1,), 0.5))
 
@@ -106,6 +110,11 @@ class DeftLayer(BaseTunerLayer):
         nn.init.normal_(self.deft_P[adapter_name], mean=0.0, std=0.02)
         if adapter_name in self.deft_gate.keys():
             nn.init.constant_(self.deft_gate[adapter_name], 0.5)
+
+        if not self.deft_use_injection[adapter_name]:
+            # PaRa (use_injection=False): no injection matrix R to initialize; the update is pure subspace removal and
+            # cannot be made an identity at init.
+            return
 
         base_weight = self.get_base_layer().weight
         R_param = self.deft_R[adapter_name]
@@ -203,6 +212,10 @@ class DeftLinear(nn.Module, DeftLayer):
         # computed in float32 for numerical stability (see `_project`), then cast back to the base weight dtype
         Q_P, right = self._project(self.deft_P[adapter_name], adapter_name)
         W = weight.to(torch.float32)
+        if not self.deft_use_injection[adapter_name]:
+            # PaRa: pure subspace removal, delta = -P_proj @ W = -Q_P @ (right.T @ W)
+            delta = -(Q_P @ (right.transpose(0, 1) @ W))
+            return delta.to(orig_dtype)
         R = self.deft_R[adapter_name].to(torch.float32)
         if self.deft_use_gating[adapter_name]:
             R = R * torch.sigmoid(self.deft_gate[adapter_name].to(torch.float32))
@@ -297,14 +310,15 @@ class DeftLinear(nn.Module, DeftLayer):
             x = self._cast_input_dtype(x, compute_dtype)
             for active_adapter in active_adapters:
                 Q_P, right = self._project(self.deft_P[active_adapter], active_adapter)
-                R = self.deft_R[active_adapter].to(compute_dtype)
-                if self.deft_use_gating[active_adapter]:
-                    R = R * torch.sigmoid(self.deft_gate[active_adapter].to(compute_dtype))
-
-                x_drop = self.deft_dropout[active_adapter](x)
-                inject = F.linear(x_drop, R) @ Q_P.transpose(0, 1)
+                # subspace-removal (correction) term: (x @ W.T @ right) @ Q_P.T = P_proj @ W @ x
                 correction = (base_product @ right) @ Q_P.transpose(0, 1)
-                result = result + inject - correction
+                result = result - correction
+                if self.deft_use_injection[active_adapter]:
+                    R = self.deft_R[active_adapter].to(compute_dtype)
+                    if self.deft_use_gating[active_adapter]:
+                        R = R * torch.sigmoid(self.deft_gate[active_adapter].to(compute_dtype))
+                    x_drop = self.deft_dropout[active_adapter](x)
+                    result = result + F.linear(x_drop, R) @ Q_P.transpose(0, 1)
 
         result = result.to(previous_dtype)
         return result
