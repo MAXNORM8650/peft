@@ -28,7 +28,15 @@ from .config import FrodConfig
 
 class FrodLayer(BaseTunerLayer):
     adapter_layer_names = ("frod_lambda_l", "frod_lambda_s_values")
-    other_param_names = ("frod_V", "frod_U", "frod_s_indices", "frod_s_size", "runtime_offload_base_weight")
+    other_param_names = (
+        "r",
+        "frod_V",
+        "frod_U",
+        "frod_s_indices",
+        "frod_s_size",
+        "runtime_offload_base_weight",
+        "frod_dropout",
+    )
 
     def __init__(self, base_layer: nn.Module, **kwargs):
         self.base_layer = base_layer
@@ -101,10 +109,9 @@ class FrodLayer(BaseTunerLayer):
         if init_weights:
             self.reset_frod_parameters(adapter_name)
         else:
-            # PEFT convention: init_weights=False should produce a non-identity adapter for merge tests.
             with torch.no_grad():
-                nn.init.normal_(self.frod_lambda_s_values[adapter_name], std=0.05)
-                self.frod_lambda_l[adapter_name].add_(torch.randn_like(self.frod_lambda_l[adapter_name]) * 0.05)
+                nn.init.normal_(self.frod_lambda_s_values[adapter_name], std=0.1)
+                self.frod_lambda_l[adapter_name].add_(torch.randn_like(self.frod_lambda_l[adapter_name]) * 0.1)
 
         # U is frozen but used in every active forward. Register it as a non-persistent buffer so it follows
         # model.to(device) once instead of being repeatedly copied from CPU and retained in CUDA's allocation cache.
