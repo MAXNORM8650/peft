@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
 import torch
 from torch import nn
 
@@ -145,3 +146,69 @@ class TestDeftMerge:
         err_downcast = roundtrip_max_abs_error(downcast_cached_factor=True)
         # Require the float32 path to be at least 10% more accurate.
         assert err_float32 < 0.9 * err_downcast
+
+
+class TestDeftSide:
+    """DEFT's `side` option: input-side (`W' = W @ (I - P_proj) + L @ Q_P.T`) is the transpose-dual of the default
+    output-side (`W' = (I - P_proj) @ W + Q_P @ R`), with the same per-rank parameter count."""
+
+    def test_default_side_is_output(self):
+        # backwards compatibility: existing DEFT is output-side, so the default must stay "output".
+        assert DeftConfig(target_modules=["lin0"]).side == "output"
+
+    def test_invalid_side_raises(self):
+        with pytest.raises(ValueError, match="side"):
+            DeftConfig(target_modules=["lin0"], side="sideways")
+
+    def test_input_side_shapes_and_param_count_match_output(self):
+        # input-side swaps the projection/injection dims vs output-side but keeps the same trainable-parameter budget.
+        def build(side):
+            torch.manual_seed(0)
+            peft_model = get_peft_model(MLP(), DeftConfig(target_modules=["lin0"], r=4, side=side))
+            layer = peft_model.base_model.model.lin0
+            trainable = sum(p.numel() for p in peft_model.parameters() if p.requires_grad)
+            return layer, trainable
+
+        out_layer, out_params = build("output")
+        in_layer, in_params = build("input")
+
+        # lin0 is Linear(10, 20): out_features=20, in_features=10
+        assert out_layer.deft_P["default"].shape == (20, 4)
+        assert out_layer.deft_R["default"].shape == (4, 10)
+        # input-side swaps P (projects the input space) and R (injects into the output space)
+        assert in_layer.deft_P["default"].shape == (10, 4)
+        assert in_layer.deft_R["default"].shape == (4, 20)
+        # identical parameter budget r * (in_features + out_features)
+        assert in_params == out_params
+
+    def test_input_side_identity_at_init_and_exact_merge(self):
+        # input-side DEFT must, like output-side, be an identity at init and have an exact merge/unmerge roundtrip --
+        # the property verl relies on when it merges the adapter into the base weights every rollout sync.
+        for method in ("relu", "qr"):
+            torch.manual_seed(0)
+            model = MLP()
+            model.eval()  # disable dropout so the forward is deterministic
+            x = torch.rand(5, 10)
+            base_out = model(x).detach().clone()
+            w0 = model.lin0.weight.detach().clone()
+
+            config = DeftConfig(target_modules=["lin0"], decomposition_method=method, side="input")
+            peft_model = get_peft_model(model, config)
+            peft_model.eval()
+            layer = peft_model.base_model.model.lin0
+
+            # identity at init: the adapted output equals the base output
+            assert torch.allclose(base_out, peft_model(x), atol=1e-5), method
+
+            # make the injection non-trivial, then merge -> forward must match the unmerged forward
+            with torch.no_grad():
+                layer.deft_R["default"].normal_(std=0.1)
+            unmerged_out = peft_model(x).detach().clone()
+            # the update actually changed the output (guards against a silently no-op input-side path)
+            assert not torch.allclose(base_out, unmerged_out, atol=1e-4), method
+
+            peft_model.merge_adapter(safe_merge=True)
+            assert torch.allclose(peft_model(x), unmerged_out, atol=1e-4), method
+            # unmerge restores the base weight exactly
+            peft_model.unmerge_adapter()
+            assert torch.allclose(layer.base_layer.weight, w0, atol=1e-5), method

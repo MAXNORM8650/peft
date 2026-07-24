@@ -34,6 +34,7 @@ class DeftLayer(BaseTunerLayer):
     other_param_names = (
         "deft_r",
         "deft_decomposition",
+        "deft_side",
         "deft_init_scale",
         "deft_para",
         "deft_scaling",
@@ -45,6 +46,7 @@ class DeftLayer(BaseTunerLayer):
         self.base_layer = base_layer
         self.deft_r = {}
         self.deft_decomposition = {}
+        self.deft_side = {}
         self.deft_init_scale = {}
         self.deft_para = {}
         self.deft_scaling = {}
@@ -77,6 +79,24 @@ class DeftLayer(BaseTunerLayer):
         else:
             raise TypeError(f"Unsupported layer type {type(base_layer)}")
 
+    def _deft_dims(self, side: str) -> tuple[int, int]:
+        """Return `(projection_dim, injection_dim)` for the given `side`.
+
+        Output-side DEFT projects the output/row space (`out_features`) and injects into the input/column space
+        (`in_features`); input-side is the transpose-dual, so the two swap. `P` is `projection_dim x r` and `R` is `r x
+        injection_dim` in both cases.
+        """
+        if side == "input":
+            return self.in_features, self.out_features
+        return self.out_features, self.in_features
+
+    def _deft_transpose(self, adapter_name: str) -> bool:
+        """Effective transpose flag mapping the *stored* weight to DEFT's logical `(projection_dim x injection_dim)`
+        layout. `transpose(W, flag)` already handles `Conv1D` (`fan_in_fan_out`); side="input" adds one more transpose
+        (input-side is output-side applied to `W.T`), so the two combine with XOR.
+        """
+        return self.fan_in_fan_out != (self.deft_side[adapter_name] == "input")
+
     def update_layer(
         self,
         adapter_name: str,
@@ -94,10 +114,15 @@ class DeftLayer(BaseTunerLayer):
         if r <= 0:
             raise ValueError(f"`r` should be a positive integer value but the value passed is {r}")
 
-        # The projection P_proj has rank at most out_features, so the effective rank is capped here (relevant for small
-        # output dimensions, e.g. r=8 on a layer with out_features=2). This keeps P and R shapes consistent with the
-        # qr decomposition, which can return at most out_features orthonormal columns.
-        r = min(r, self.out_features)
+        self.deft_side[adapter_name] = config.side
+        # projection_dim = the space DEFT removes a sub-space from (out_features for the default output-side,
+        # in_features for side="input"); injection_dim is the other one. They swap for input-side.
+        proj_dim, inj_dim = self._deft_dims(config.side)
+
+        # The projection P_proj has rank at most projection_dim, so the effective rank is capped here (relevant for
+        # small dimensions, e.g. r=8 on a layer with proj_dim=2). This keeps P and R shapes consistent with the qr
+        # decomposition, which can return at most projection_dim orthonormal columns.
+        r = min(r, proj_dim)
         self.deft_r[adapter_name] = r
         self.deft_decomposition[adapter_name] = config.decomposition_method
         self.deft_init_scale[adapter_name] = config.init_scale
@@ -111,11 +136,12 @@ class DeftLayer(BaseTunerLayer):
         else:
             self.deft_dropout[adapter_name] = nn.Identity()
 
-        # P: projection direction (out_features x r); R: injection matrix (r x in_features, full DEFT only).
-        # With `para=True` the update is pure subspace removal `-P_proj @ W` (the PaRa method), and R is unused.
-        self.deft_P[adapter_name] = nn.Parameter(torch.empty(self.out_features, r))
+        # P: projection direction (proj_dim x r); R: injection matrix (r x inj_dim, full DEFT only). For the default
+        # output-side these are (out_features x r) and (r x in_features); for side="input" they are (in_features x r)
+        # and (r x out_features). With `para=True` the update is pure subspace removal `-P_proj @ W` (PaRa), R unused.
+        self.deft_P[adapter_name] = nn.Parameter(torch.empty(proj_dim, r))
         if not config.para:
-            self.deft_R[adapter_name] = nn.Parameter(torch.empty(r, self.in_features))
+            self.deft_R[adapter_name] = nn.Parameter(torch.empty(r, inj_dim))
 
         self.reset_deft_parameters(adapter_name, init_weights=config.init_weights)
 
@@ -148,8 +174,8 @@ class DeftLayer(BaseTunerLayer):
             # avoiding the immediate "forgetting" caused by removing a sub-space of W.
             P = self.deft_P[adapter_name].detach().to(base_weight.device)
             _, right = self._project(P, adapter_name)
-            # transpose for `Conv1D`, whose weight is stored as (in_features, out_features), to the logical (out, in)
-            W = transpose(base_weight.detach().to(torch.float32), self.fan_in_fan_out)
+            # map the stored weight to DEFT's logical (proj_dim, inj_dim) layout (handles Conv1D and side="input")
+            W = transpose(base_weight.detach().to(torch.float32), self._deft_transpose(adapter_name))
             R_init = right.transpose(0, 1) @ W
             # divide by the injection scaling so that (scaling * R_init) == right.T @ W, keeping delta == 0 at init
             R_init = R_init / self.deft_scaling[adapter_name]
@@ -217,9 +243,9 @@ class DeftLinear(nn.Module, DeftLayer):
         float32. Caching this instead of the full `out x in` delta lets `unmerge` recompute the exact delta while
         storing roughly `r / out_features` as much memory.
         """
-        # computed in float32 for numerical stability (see `_project`); transpose handles `Conv1D` (fan_in_fan_out),
-        # whose weight is stored as (in_features, out_features), so `W` is always logical (out_features, in_features)
-        weight = transpose(self.get_base_layer().weight.to(torch.float32), self.fan_in_fan_out)
+        # computed in float32 for numerical stability (see `_project`); `_deft_transpose` maps the stored weight to
+        # DEFT's logical (proj_dim, inj_dim) layout (handles Conv1D `fan_in_fan_out` and side="input")
+        weight = transpose(self.get_base_layer().weight.to(torch.float32), self._deft_transpose(adapter_name))
         _, right = self._project(self.deft_P[adapter_name], adapter_name)
         return right.transpose(0, 1) @ weight
 
@@ -235,8 +261,8 @@ class DeftLinear(nn.Module, DeftLayer):
         else:
             R = self.deft_R[adapter_name].to(torch.float32) * self.deft_scaling[adapter_name]
             delta = Q_P @ (R - factor)
-        # delta is logical (out_features, in_features); transpose back to the base layer's storage order (Conv1D)
-        return transpose(delta, self.fan_in_fan_out).to(orig_dtype)
+        # delta is logical (proj_dim, inj_dim); transpose back to the base layer's storage order (Conv1D / side="input")
+        return transpose(delta, self._deft_transpose(adapter_name)).to(orig_dtype)
 
     def get_delta_weight(self, adapter_name: str) -> torch.Tensor:
         """Return the additive delta such that `W + delta` equals the DEFT-adapted weight.
@@ -340,6 +366,19 @@ class DeftLinear(nn.Module, DeftLayer):
             x = self._cast_input_dtype(x, compute_dtype)
             for active_adapter in active_adapters:
                 Q_P, right = self._project(self.deft_P[active_adapter], active_adapter)
+                if self.deft_side[active_adapter] == "input":
+                    # input-side: project x onto the learned input sub-space, remove W applied to it, then inject.
+                    # x @ delta.T = (x @ Q_P) @ L.T - (x @ Q_P @ right.T) @ W.T, base weight in logical (out, in).
+                    W = transpose(base_layer.weight, self.fan_in_fan_out).to(compute_dtype)
+                    proj_x = (x @ Q_P) @ right.transpose(0, 1)  # input-subspace projection of x (..., in_features)
+                    result = result - F.linear(proj_x, W)  # subspace-removal: W @ proj_x (..., out_features)
+                    if not self.deft_para[active_adapter]:
+                        R = self.deft_R[active_adapter].to(compute_dtype)  # (r, out_features), plays the role of L.T
+                        R = R * self.deft_scaling[active_adapter]
+                        x_drop = self.deft_dropout[active_adapter](x)
+                        result = result + (x_drop @ Q_P) @ R  # injection: (x @ Q_P) @ L.T
+                    continue
+                # output-side (original): x @ delta.T = [(x @ R.T) - (x @ W.T) @ right] @ Q_P.T
                 # subspace-removal (correction) term: (x @ W.T @ right) @ Q_P.T = P_proj @ W @ x
                 correction = (base_product @ right) @ Q_P.transpose(0, 1)
                 result = result - correction

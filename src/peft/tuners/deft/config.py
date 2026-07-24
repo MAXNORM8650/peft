@@ -55,6 +55,11 @@ class DeftConfig(PeftConfig):
         decomposition_method (`str`):
             How the projector `P_proj` is derived from `P`. Either `"relu"` (default, non-orthogonal `P @ relu(P).T`)
             or `"qr"` (orthogonal `Q_P @ Q_P.T`).
+        side (`str`):
+            Which weight space DEFT operates on: `"output"` (default) removes/injects a sub-space of the output (row)
+            space (`W' = (I - P_proj) @ W + Q_P @ R`), while `"input"` operates on the input (column) space (`W' = W @
+            (I - P_proj) + L @ Q_P.T`). The two are transpose-duals with the same per-rank parameter count; `"output"`
+            is the original DEFT behavior.
         init_scale (`float`):
             Scaling applied to the standard deviation used to initialize the injection matrix `R` (only used when
             `init_weights=False`). Smaller values keep the injected update closer to zero at initialization. Defaults
@@ -109,6 +114,17 @@ class DeftConfig(PeftConfig):
             "help": (
                 "How the projector P_proj is derived from P. Either 'relu' (default, non-orthogonal P @ relu(P).T) or "
                 "'qr' (orthogonal Q_P @ Q_P.T)."
+            ),
+        },
+    )
+    side: Literal["input", "output"] = field(
+        default="output",
+        metadata={
+            "help": (
+                "Which weight space DEFT operates on. `'output'` (default) removes/injects a sub-space of the output "
+                "(row) space: `W' = (I - P_proj) @ W + Q_P @ R`. `'input'` operates on the input (column) space "
+                "instead: `W' = W @ (I - P_proj) + L @ Q_P.T`, the transpose-dual with identical per-rank parameter "
+                "count. `'output'` is unchanged from the original DEFT."
             ),
         },
     )
@@ -195,6 +211,9 @@ class DeftConfig(PeftConfig):
             raise ValueError(
                 f"Unknown decomposition_method '{self.decomposition_method}', must be one of {sorted(valid_methods)}."
             )
+
+        if self.side not in {"input", "output"}:
+            raise ValueError(f"Unknown side '{self.side}', must be 'input' or 'output'.")
 
         # if target_modules is a regex expression, then layers_to_transform should be None
         if isinstance(self.target_modules, str) and self.layers_to_transform is not None:
